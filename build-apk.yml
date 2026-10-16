@@ -1,0 +1,327 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Version name (e.g. 1.0.0)'
+        required: false
+        default: '1.0.0'
+      version_code:
+        description: 'Version code (whole number, bump every build)'
+        required: false
+        default: '1'
+      release_notes:
+        description: 'Release notes'
+        required: false
+        default: 'First release'
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK packages
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          if ! command -v sdkmanager >/dev/null 2>&1; then
+            export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin"
+          fi
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Scaffold Android project
+        env:
+          APP_VERSION_NAME: ${{ inputs.version_name }}
+          APP_VERSION_CODE: ${{ inputs.version_code }}
+        run: |
+          echo "=== Files in repo ==="
+          ls -la
+          HTML_FILE=./index.html
+          if [ ! -f "$HTML_FILE" ]; then
+            echo "ERROR: index.html was not found in the repository root."
+            exit 1
+          fi
+          echo "Using $HTML_FILE as the app page."
+          if ! grep -q 'id="lynxos-bowling-app"' "$HTML_FILE"; then
+            echo "ERROR: $HTML_FILE is not the Lynxos Bowling app file (lynxos-bowling-app marker missing)."
+            exit 1
+          fi
+
+          mkdir -p app/src/main/java/com/lynxosbowling/app app/src/main/assets/www
+          cp "$HTML_FILE" app/src/main/assets/www/index.html
+
+          # TV (Leanback) banner so the app shows in the TV launcher row.
+          mkdir -p app/src/main/res/drawable
+          if [ -f tv_banner.png ]; then
+            cp tv_banner.png app/src/main/res/drawable/tv_banner.png
+            echo "TV banner copied from repo."
+          else
+            pip install --quiet pillow
+            python3 - <<'PYEOF'
+          from PIL import Image, ImageDraw
+          img = Image.new("RGB", (320, 180), (0, 0, 0))
+          d = ImageDraw.Draw(img)
+          d.rectangle([4, 4, 315, 175], outline=(245, 197, 24), width=6)
+          # bowling ball
+          d.ellipse([28, 55, 108, 135], fill=(38, 38, 90), outline=(245, 197, 24), width=3)
+          d.ellipse([58, 78, 66, 86], fill=(245, 197, 24))
+          d.ellipse([72, 88, 80, 96], fill=(245, 197, 24))
+          d.ellipse([58, 98, 66, 106], fill=(245, 197, 24))
+          d.text((128, 52), "LYNXOS", fill=(245, 197, 24))
+          d.text((128, 92), "BOWLING", fill=(255, 255, 255))
+          img.save("app/src/main/res/drawable/tv_banner.png")
+          print("TV banner generated.")
+          PYEOF
+          fi
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          EOF
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "LynxosBowling"
+          include(":app")
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.lynxosbowling.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.lynxosbowling.app'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode __APP_VERSION_CODE__
+                  versionName '__APP_VERSION_NAME__'
+              }
+          }
+          EOF
+          sed -i "s/__APP_VERSION_CODE__/$APP_VERSION_CODE/g; s/__APP_VERSION_NAME__/$APP_VERSION_NAME/g" app/build.gradle
+
+          cat > app/src/main/AndroidManifest.xml <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <application
+                  android:label="Lynxos Bowling"
+                  android:banner="@drawable/tv_banner"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name="com.lynxosbowling.app.MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/lynxosbowling/app/MainActivity.java <<'EOF'
+          package com.lynxosbowling.app;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.speech.tts.TextToSpeech;
+          import android.view.KeyEvent;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import java.util.Locale;
+
+          public class MainActivity extends Activity {
+              private WebView webView;
+              private TextToSpeech tts;
+              private boolean ttsReady = false;
+              private String pendingTts = null;
+              private boolean backArmed = false;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  webView = new WebView(this);
+                  webView.setBackgroundColor(0xFF000000);
+                  WebSettings s = webView.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setAllowFileAccess(true);
+                  s.setAllowFileAccessFromFileURLs(true);
+                  s.setAllowUniversalAccessFromFileURLs(true);
+                  webView.setWebViewClient(new WebViewClient());
+                  tts = new TextToSpeech(this, new TextToSpeech.OnInitListener() {
+                      @Override
+                      public void onInit(int status) {
+                          if (status == TextToSpeech.SUCCESS) {
+                              try {
+                                  int result = tts.setLanguage(Locale.US);
+                                  ttsReady = result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED;
+                              } catch (Exception e) { ttsReady = false; }
+                              if (ttsReady && pendingTts != null) {
+                                  String text = pendingTts; pendingTts = null;
+                                  try { tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "bowling-tts"); } catch (Exception ignored) {}
+                              }
+                          }
+                      }
+                  });
+                  webView.addJavascriptInterface(new Object() {
+                      @JavascriptInterface
+                      public void speak(final String text) {
+                          if (text == null) return;
+                          runOnUiThread(new Runnable() {
+                              @Override public void run() {
+                                  if (ttsReady && tts != null) {
+                                      try { tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "bowling-tts"); } catch (Exception ignored) {}
+                                  } else {
+                                      pendingTts = text;
+                                  }
+                              }
+                          });
+                      }
+                  }, "LynxosTts");
+                  setContentView(webView);
+                  webView.loadUrl("file:///android_asset/www/index.html");
+              }
+
+              /* Fire TV select button: route press/hold/release straight to JS
+                 so hold-to-throw timing works no matter how the WebView
+                 translates DPAD_CENTER. */
+              @Override
+              public boolean dispatchKeyEvent(KeyEvent event) {
+                  int kc = event.getKeyCode();
+                  if (kc == KeyEvent.KEYCODE_DPAD_CENTER || kc == KeyEvent.KEYCODE_BUTTON_A) {
+                      final boolean rep = event.getRepeatCount() > 0;
+                      if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                          webView.post(new Runnable() {
+                              @Override public void run() {
+                                  webView.evaluateJavascript("onKeyDown(13," + rep + ")", null);
+                              }
+                          });
+                          return true;
+                      } else if (event.getAction() == KeyEvent.ACTION_UP) {
+                          webView.post(new Runnable() {
+                              @Override public void run() {
+                                  webView.evaluateJavascript("onKeyUp(13)", null);
+                              }
+                          });
+                          return true;
+                      }
+                  }
+                  return super.dispatchKeyEvent(event);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (backArmed) { backArmed = false; super.onBackPressed(); return; }
+                  final Activity self = this;
+                  try {
+                      webView.evaluateJavascript(
+                          "(function(){ try { if (window.tvBack) return window.tvBack(); } catch(e){} return 'exit'; })()",
+                          new ValueCallback<String>() {
+                              @Override
+                              public void onReceiveValue(String value) {
+                                  String v = value == null ? "exit" : value.replace("\"", "").trim();
+                                  if ("exit".equals(v)) {
+                                      backArmed = true;
+                                      self.onBackPressed();
+                                  }
+                                  /* else: JS consumed the back press (pause menu) */
+                              }
+                          });
+                  } catch (Exception e) {
+                      super.onBackPressed();
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  try { if (tts != null) tts.shutdown(); } catch (Exception ignored) {}
+                  try { if (webView != null) webView.destroy(); } catch (Exception ignored) {}
+                  super.onDestroy();
+              }
+          }
+          EOF
+          echo "Scaffold complete."
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build release APK (unsigned)
+        run: gradle :app:assembleRelease
+
+      - name: Sign release APK with the Lynxos key
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          APKSIGNER="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > /tmp/lynxos-release.p12
+          "$APKSIGNER" sign --ks /tmp/lynxos-release.p12 --ks-type PKCS12 \
+            --ks-pass "pass:${{ secrets.KEYSTORE_PASSWORD }}" \
+            --key-pass "pass:${{ secrets.KEY_PASSWORD }}" \
+            --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+            --out app/build/outputs/apk/release/app-release.apk \
+            app/build/outputs/apk/release/app-release-unsigned.apk
+          rm -f /tmp/lynxos-release.p12
+          "$APKSIGNER" verify --print-certs app/build/outputs/apk/release/app-release.apk | head -3
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: lynxos-bowling-apk
+          path: app/build/outputs/apk/release/app-release.apk
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version_name }}+${{ inputs.version_code }}
+          name: Lynxos Bowling v${{ inputs.version_name }}+${{ inputs.version_code }}
+          body: ${{ inputs.release_notes }}
+          files: app/build/outputs/apk/release/app-release.apk
