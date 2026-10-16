@@ -1,0 +1,730 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lynxos Bowling</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+    font-family: sans-serif; color: #f5c518;
+    -webkit-user-select: none; user-select: none;
+  }
+  #game { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #srStatus {
+    position: fixed; left: 8px; bottom: 8px; max-width: 90vw;
+    color: #f5c518; font-size: 22px; background: rgba(0,0,0,.65);
+    padding: 8px 14px; border-radius: 10px; border: 1px solid #f5c518;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body id="lynxos-bowling-app">
+<canvas id="game" aria-label="Lynxos Bowling game"></canvas>
+<div id="srStatus" role="status" aria-live="polite"></div>
+<script>
+"use strict";
+/* ================= Lynxos Bowling v1.0.0 =================
+   Fire TV / Android TV bowling. D-pad + OK.
+   Hold OK to wind up (rising tone = power), release to throw.
+   Left/Right while holding = hook/spin. Blind-first: full narration. */
+
+/* ---------- tiny utils ---------- */
+function $(id){ return document.getElementById(id); }
+function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
+function lerp(a,b,t){ return a+(b-a)*t; }
+function rand(a,b){ return a+Math.random()*(b-a); }
+
+/* ---------- narration ---------- */
+var srBox = $("srStatus");
+var lastSay = "";
+function say(text){
+  if(!text || text === lastSay) return;
+  lastSay = text;
+  try { srBox.textContent = text; } catch(e){}
+  try {
+    if(window.LynxosTts && LynxosTts.speak){ LynxosTts.speak(text); return; }
+  } catch(e){}
+  try {
+    if(window.speechSynthesis){
+      speechSynthesis.cancel();
+      speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+    }
+  } catch(e){}
+}
+
+/* ---------- sound effects (all synthesized, no assets) ---------- */
+var Sfx = (function(){
+  var ctx = null, rollNodes = null, powerOsc = null, powerGain = null;
+  function ac(){
+    if(!ctx){
+      try { ctx = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){ ctx = null; }
+    }
+    if(ctx && ctx.state === "suspended"){ try{ ctx.resume(); }catch(e){} }
+    return ctx;
+  }
+  function noiseBuffer(){
+    var c = ac(); if(!c) return null;
+    var len = c.sampleRate * 1.2, buf = c.createBuffer(1, len, c.sampleRate), d = buf.getChannelData(0);
+    for(var i=0;i<len;i++) d[i] = Math.random()*2-1;
+    return buf;
+  }
+  var sharedNoise = null;
+  function burst(when, dur, freq, gain, type){
+    var c = ac(); if(!c) return;
+    try{
+      var o = c.createOscillator(), g = c.createGain();
+      o.type = type || "sine"; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, when);
+      g.gain.exponentialRampToValueAtTime(gain, when+0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, when+dur);
+      o.connect(g); g.connect(c.destination);
+      o.start(when); o.stop(when+dur+0.05);
+    }catch(e){}
+  }
+  function noiseBurst(when, dur, gain, filterFreq){
+    var c = ac(); if(!c) return;
+    try{
+      if(!sharedNoise) sharedNoise = noiseBuffer();
+      var s = c.createBufferSource(); s.buffer = sharedNoise; s.loop = true;
+      var f = c.createBiquadFilter(); f.type = "bandpass"; f.frequency.value = filterFreq; f.Q.value = 1.2;
+      var g = c.createGain();
+      g.gain.setValueAtTime(0.0001, when);
+      g.gain.exponentialRampToValueAtTime(gain, when+0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, when+dur);
+      s.connect(f); f.connect(g); g.connect(c.destination);
+      s.start(when); s.stop(when+dur+0.05);
+    }catch(e){}
+  }
+  return {
+    unlock: function(){ ac(); },
+    click: function(){ var c=ac(); if(c) burst(c.currentTime, 0.07, 880, 0.15, "square"); },
+    gutter: function(){ var c=ac(); if(!c) return; var t=c.currentTime; burst(t,0.35,220,0.2,"sawtooth"); burst(t+0.18,0.45,147,0.2,"sawtooth"); },
+    strike: function(){ var c=ac(); if(!c) return; var t=c.currentTime, n=[523,659,784,1047]; for(var i=0;i<n.length;i++) burst(t+i*0.09,0.22,n[i],0.22,"triangle"); },
+    spare: function(){ var c=ac(); if(!c) return; var t=c.currentTime; burst(t,0.2,659,0.2,"triangle"); burst(t+0.14,0.3,880,0.2,"triangle"); },
+    pinHit: function(count){
+      var c=ac(); if(!c) return; var t=c.currentTime;
+      for(var i=0;i<count;i++){
+        noiseBurst(t+i*rand(0.03,0.07), 0.16, 0.5, rand(1800,3200));
+        burst(t+i*rand(0.03,0.07), 0.1, rand(900,1400), 0.12, "triangle");
+      }
+    },
+    rollStart: function(){
+      var c=ac(); if(!c||rollNodes) return;
+      try{
+        if(!sharedNoise) sharedNoise = noiseBuffer();
+        var s=c.createBufferSource(); s.buffer=sharedNoise; s.loop=true;
+        var f=c.createBiquadFilter(); f.type="lowpass"; f.frequency.value=320;
+        var g=c.createGain(); g.gain.value=0.0;
+        s.connect(f); f.connect(g); g.connect(c.destination); s.start();
+        rollNodes={s:s,g:g};
+      }catch(e){}
+    },
+    rollSet: function(level){ try{ if(rollNodes) rollNodes.g.gain.value = clamp(level,0,1)*0.35; }catch(e){} },
+    rollStop: function(){
+      try{
+        if(rollNodes){ var n=rollNodes; rollNodes=null;
+          n.g.gain.setTargetAtTime(0.0001, ac().currentTime, 0.08);
+          setTimeout(function(){ try{n.s.stop();}catch(e){} }, 400);
+        }
+      }catch(e){}
+    },
+    powerStart: function(){
+      var c=ac(); if(!c||powerOsc) return;
+      try{
+        powerOsc=c.createOscillator(); powerGain=c.createGain();
+        powerOsc.type="sine"; powerOsc.frequency.value=140; powerGain.gain.value=0.12;
+        powerOsc.connect(powerGain); powerGain.connect(c.destination); powerOsc.start();
+      }catch(e){}
+    },
+    powerSet: function(p){ try{ if(powerOsc) powerOsc.frequency.value = 140 + p*400; }catch(e){} },
+    powerStop: function(ok){
+      try{
+        if(powerOsc){ var o=powerOsc,g=powerGain; powerOsc=null; powerGain=null;
+          g.gain.setTargetAtTime(0.0001, ac().currentTime, 0.03);
+          setTimeout(function(){ try{o.stop();}catch(e){} }, 200);
+        }
+      }catch(e){}
+      if(ok){ var c=ac(); if(c) burst(c.currentTime,0.12,660,0.18,"triangle"); }
+    }
+  };
+})();
+</script>
+<script>
+"use strict";
+/* ================= game data ================= */
+var LANE_HALF = 1.75;      /* lane half width */
+var HEAD_Z = 60;           /* head pin distance */
+var BALL_R = 0.36, PIN_R = 0.42;
+var POSITIONS = [-1.2,-0.8,-0.4,0,0.4,0.8,1.2];   /* 7 slots on foul line */
+var POS_NAMES = ["far left","left 2","left 1","center","right 1","right 2","far right"];
+
+/* pin home positions: standard triangle, 1ft spacing */
+var PIN_HOME = [
+  {x:0,    z:60   },
+  {x:-0.5, z:60.87}, {x:0.5, z:60.87},
+  {x:-1,   z:61.74}, {x:0, z:61.74}, {x:1, z:61.74},
+  {x:-1.5, z:62.61}, {x:-0.5,z:62.61}, {x:0.5,z:62.61}, {x:1.5,z:62.61}
+];
+
+/* ================= game state ================= */
+var G = {
+  screen: "title",   /* title | aim | windup | throw | sweep | pause | gameover */
+  frame: 1, ball: 1,
+  rolls: [],               /* flat list of pins-down per throw */
+  tenthThrows: 0,
+  pins: [],                /* {x,z,hx,hz,vx,vz,down,flyT} */
+  standingCount: 10,
+  posIdx: 3, angleDeg: 0, spin: 0,
+  power: 0, holdT: 0,
+  ball: 1,                /* ball number within frame */
+  ballObj: null,           /* physics ball {x,z,vx,vz,gutter,done} */
+  pauseIdx: 0,
+  high: 0,
+  msg: "", msgT: 0,
+  newBest: false
+};
+try { G.high = parseInt(localStorage.getItem("lynxos_bowling_high")||"0",10)||0; } catch(e){}
+
+function resetRack(){
+  G.pins = PIN_HOME.map(function(p){ return {x:p.x, z:p.z, hx:p.x, hz:p.z, vx:0, vz:0, down:false, flyT:0}; });
+  G.standingCount = 10;
+}
+function pinsDownThisThrow(){
+  var n=0;
+  for(var i=0;i<G.pins.length;i++) if(G.pins[i].down) n++;
+  return n;
+}
+
+/* ================= scoring (standard 10-frame) ================= */
+function computeScore(rolls){
+  var score=0, ri=0, frames=[];
+  for(var f=0; f<10; f++){
+    if(f<9){
+      if(rolls[ri]===10){ /* strike */
+        score += 10 + (rolls[ri+1]||0) + (rolls[ri+2]||0);
+        frames.push({throws:[10], score: (ri+2<rolls.length||ri+1>=rolls.length)?score:null, strike:true});
+        ri+=1;
+      } else {
+        var t1=rolls[ri]||0, t2=rolls[ri+1]||0;
+        if(t1+t2===10){ score += 10 + (rolls[ri+2]||0); frames.push({throws:[t1,t2], score:(ri+2<rolls.length)?score:null, spare:true}); }
+        else { score += t1+t2; frames.push({throws:[t1,t2], score:score}); }
+        ri+=2;
+      }
+    } else {
+      var ft=rolls.slice(ri,ri+3), fs=0;
+      for(var k=0;k<ft.length;k++) fs+=ft[k];
+      var done = ft.length===3 || (ft.length===2 && ft[0]+ft[1]<10 && ft[0]!==10);
+      score += fs;
+      frames.push({throws:ft, score: done?score:null});
+    }
+  }
+  return {total:score, frames:frames};
+}
+
+/* frame state machine: call after each throw's pins are counted */
+function advanceAfterThrow(down){
+  G.rolls.push(down);
+  if(G.frame < 10){
+    if(G.ball===1){
+      if(down===10){ nextFrame(); }
+      else { G.ball=2; }
+    } else { nextFrame(); }
+  } else {
+    G.tenthThrows++;
+    var r=G.rolls, n=r.length, t1=r[n-1];
+    if(G.tenthThrows===1){
+      if(t1===10){ resetRack(); }
+      G.ball=2;
+    } else if(G.tenthThrows===2){
+      var p1=r[n-2];
+      if(p1===10){
+        if(t1===10){ resetRack(); }
+        /* else keep remaining pins */
+      } else {
+        if(p1+t1===10){ resetRack(); }
+        else { endGame(); return; }
+      }
+      G.ball=3;
+    } else {
+      endGame(); return;
+    }
+  }
+  if(G.screen!=="gameover") startAim();
+}
+function nextFrame(){ G.frame++; G.ball=1; resetRack(); }
+function endGame(){
+  G.screen="gameover";
+  var s=computeScore(G.rolls).total;
+  G.newBest = s > G.high;
+  if(G.newBest){ G.high=s; try{ localStorage.setItem("lynxos_bowling_high", String(s)); }catch(e){} }
+  Sfx.rollStop();
+  if(G.newBest){ Sfx.strike(); say("Game over. Final score "+s+". New best score!"); }
+  else { Sfx.spare(); say("Game over. Final score "+s+". Best is "+G.high+"."); }
+}
+
+function startAim(){
+  G.screen="aim";
+  G.posIdx=3; G.angleDeg=0; G.spin=0; G.power=0; G.holdT=0; G.ballObj=null;
+  var left = 10 - pinsDownThisThrow();
+  say("Frame "+G.frame+", ball "+G.ball+". "+left+" pins standing. Aim with left and right. Hold OK to throw.");
+}
+function newGame(){
+  G.frame=1; G.ball=1; G.rolls=[]; G.tenthThrows=0; G.newBest=false;
+  resetRack();
+  say("New game. Ten frames, two balls each. Good luck.");
+  startAim();
+}
+</script>
+<script>
+"use strict";
+/* ================= throwing & physics ================= */
+function beginWindup(){
+  if(G.screen!=="aim") return;
+  G.screen="windup"; G.holdT=0; G.power=0; G.spin=0;
+  Sfx.unlock(); Sfx.powerStart();
+  say("Winding up. Release OK to throw. Left and right for hook.");
+}
+function releaseThrow(){
+  if(G.screen!=="windup") return;
+  var hold=G.holdT;
+  G.power = clamp(0.35 + (hold/1.4)*0.65, 0.35, 1.0);
+  Sfx.powerStop(true);
+  /* high power = slight wildness (risk/reward) */
+  var wild = G.power>0.92 ? rand(-0.22,0.22) : 0;
+  var ang = (G.angleDeg*Math.PI/180);
+  var vz = 26 + G.power*22;
+  G.ballObj = {
+    x: POSITIONS[G.posIdx], z: 0,
+    vx: Math.sin(ang)*vz + wild*4, vz: vz,
+    spin: G.spin, gutter: false, done: false
+  };
+  G.throwStartedFull = (pinsDownThisThrow()===0);
+  G.screen="throw";
+  Sfx.rollStart();
+  var pw = G.power>0.8?"Hard":(G.power>0.55?"Medium":"Soft");
+  var sp = G.spin>0.2?" Hooking right.":(G.spin<-0.2?" Hooking left.":"");
+  say(pw+" ball away."+sp);
+}
+function updateWindup(dt){
+  G.holdT += dt;
+  G.power = clamp(0.35 + (G.holdT/1.4)*0.65, 0.35, 1.0);
+  Sfx.powerSet(G.power);
+}
+function updateThrow(dt){
+  var b=G.ballObj; if(!b||b.done) return;
+  /* hook: spin curves the ball laterally */
+  if(!b.gutter && b.z < 55) b.vx += b.spin * 7.5 * dt;
+  b.x += b.vx*dt; b.z += b.vz*dt;
+  /* gutter check */
+  if(!b.gutter && Math.abs(b.x) > LANE_HALF && b.z < HEAD_Z+4){
+    b.gutter=true; b.x = b.x>0?2.05:-2.05; b.vx=0;
+    say("Gutter ball.");
+  }
+  if(!b.gutter){
+    /* ball vs pins */
+    for(var i=0;i<G.pins.length;i++){
+      var p=G.pins[i]; if(p.down) continue;
+      var dx=p.x-b.x, dz=p.z-b.z;
+      if(dx*dx+dz*dz < (BALL_R+PIN_R)*(BALL_R+PIN_R)){
+        knockPin(p, b);
+      }
+    }
+  }
+  /* flying pins move + hit others */
+  var anyFlying=false;
+  for(var j=0;j<G.pins.length;j++){
+    var q=G.pins[j];
+    if(q.down && q.flyT<1.4){
+      anyFlying=true; q.flyT+=dt;
+      q.x+=q.vx*dt; q.z+=q.vz*dt;
+      q.vx*=Math.max(0,1-2.2*dt); q.vz*=Math.max(0,1-2.2*dt);
+      for(var k=0;k<G.pins.length;k++){
+        if(k===j) continue;
+        var r=G.pins[k]; if(r.down) continue;
+        var ddx=r.x-q.x, ddz=r.z-q.z;
+        if(ddx*ddx+ddz*ddz < 0.72*0.72){
+          r.down=true; r.flyT=0;
+          r.vx=q.vx*0.55+rand(-2,2); r.vz=q.vz*0.55+rand(1,4);
+          G.standingCount--;
+          Sfx.pinHit(1);
+        }
+      }
+    }
+  }
+  Sfx.rollSet(clamp(b.vz/48,0,1)*(b.gutter?0.4:1));
+  if(b.z > 68){ b.done=true; finishThrow(); }
+}
+function knockPin(p, b){
+  if(p.down) return;
+  p.down=true; p.flyT=0;
+  var away = Math.atan2(p.x-b.x, p.z-b.z);
+  var sp = b.vz*rand(0.35,0.6);
+  p.vx = Math.sin(away)*sp + b.vx*0.5 + rand(-1.5,1.5);
+  p.vz = Math.cos(away)*sp*0.9 + rand(0,2);
+  G.standingCount--;
+  b.vx*=0.94; b.vz*=0.965;
+  Sfx.pinHit(1);
+}
+function finishThrow(){
+  Sfx.rollStop();
+  var down = pinsDownThisThrow();
+  var standing = 10-down;
+  if(G.ballObj.gutter && down===0){
+    /* already announced */
+  } else if(down===10 && G.throwStartedFull){
+    Sfx.strike(); say("Strike!");
+  } else if(down===10){
+    Sfx.spare(); say("Spare! All ten down.");
+  } else if(down===0){
+    say("Missed everything. "+standing+" pins still standing.");
+  } else {
+    Sfx.pinHit(0);
+    say(down+" down. "+(standing===1?"One pin":standing+" pins")+" standing.");
+  }
+  G.screen="sweep"; G.msgT=0;
+}
+function updateSweep(dt){
+  G.msgT+=dt;
+  if(G.msgT>1.1){
+    var down=pinsDownThisThrow();
+    advanceAfterThrow(down);
+  }
+}
+
+/* ================= input ================= */
+var okHeld=false;
+function onKeyDown(code, repeat){
+  Sfx.unlock();
+  if(G.screen==="title"){
+    if(code===13 && !repeat){ Sfx.click(); newGame(); }
+    return true;
+  }
+  if(G.screen==="gameover"){
+    if(code===13 && !repeat){ Sfx.click(); newGame(); }
+    else if((code===8||code===461) && !repeat){ G.screen="title"; say("Lynxos Bowling. Press OK to play."); }
+    return true;
+  }
+  if(G.screen==="pause"){
+    if(code===38 && !repeat){ G.pauseIdx=(G.pauseIdx+2)%3; Sfx.click(); say(pauseLabel()); }
+    else if(code===40 && !repeat){ G.pauseIdx=(G.pauseIdx+1)%3; Sfx.click(); say(pauseLabel()); }
+    else if(code===13 && !repeat){ Sfx.click(); doPauseChoice(); }
+    else if((code===8||code===461) && !repeat){ resumeGame(); }
+    return true;
+  }
+  if(G.screen==="aim"){
+    if(code===37 && !repeat){ G.posIdx=Math.max(0,G.posIdx-1); Sfx.click(); say("Position: "+POS_NAMES[G.posIdx]+"."); }
+    else if(code===39 && !repeat){ G.posIdx=Math.min(6,G.posIdx+1); Sfx.click(); say("Position: "+POS_NAMES[G.posIdx]+"."); }
+    else if(code===38 && !repeat){ G.angleDeg=clamp(G.angleDeg+2,-10,10); Sfx.click(); say("Aiming "+angleName()+"."); }
+    else if(code===40 && !repeat){ G.angleDeg=clamp(G.angleDeg-2,-10,10); Sfx.click(); say("Aiming "+angleName()+"."); }
+    else if(code===13 && !repeat){ beginWindup(); }
+    else if((code===8||code===461) && !repeat){ pauseGame(); }
+    return true;
+  }
+  if(G.screen==="windup"){
+    if(code===37 && !repeat){ G.spin=clamp(G.spin-0.25,-1,1); Sfx.click(); say(spinName()+"."); }
+    else if(code===39 && !repeat){ G.spin=clamp(G.spin+0.25,-1,1); Sfx.click(); say(spinName()+"."); }
+    else if((code===8||code===461) && !repeat){ cancelWindup(); }
+    return true;
+  }
+  if(G.screen==="throw"||G.screen==="sweep"){
+    if((code===8||code===461) && !repeat){ pauseGame(); }
+    return true;
+  }
+  return false;
+}
+function onKeyUp(code){
+  if(code===13 && G.screen==="windup"){ releaseThrow(); return true; }
+  return false;
+}
+function angleName(){
+  if(G.angleDeg===0) return "straight ahead";
+  return Math.abs(G.angleDeg)+" degrees "+(G.angleDeg>0?"right":"left");
+}
+function spinName(){
+  if(G.spin>0.2) return "Hooking right";
+  if(G.spin<-0.2) return "Hooking left";
+  return "No hook";
+}
+function cancelWindup(){
+  G.screen="aim"; Sfx.powerStop(false);
+  say("Throw cancelled. Aim again.");
+}
+function pauseGame(){
+  if(G.screen==="throw"||G.screen==="sweep"||G.screen==="aim"||G.screen==="windup"){
+    G.screen="pause"; G.pauseIdx=0;
+    Sfx.rollStop(); Sfx.powerStop(false);
+    say("Paused. "+pauseLabel()+". Up and down to choose, OK to select.");
+  }
+}
+function pauseLabel(){
+  return ["Resume game","Restart game","Quit to title"][G.pauseIdx];
+}
+function doPauseChoice(){
+  if(G.pauseIdx===0) resumeGame();
+  else if(G.pauseIdx===1){ newGame(); }
+  else { G.screen="title"; say("Lynxos Bowling. Press OK to play."); }
+}
+function resumeGame(){ startAimResume(); }
+function startAimResume(){
+  /* return to aiming fresh for current ball */
+  G.ballObj=null; G.screen="aim";
+  var left=10-pinsDownThisThrow();
+  say("Resumed. Frame "+G.frame+", ball "+G.ball+". "+left+" pins standing.");
+}
+function onTvBack(){ /* called from native onBackPressed */
+  onKeyDown(8,false);
+}
+/* native TV entry point: returns 'exit' only on the title screen */
+function tvBack(){
+  if(G.screen==="title") return "exit";
+  onTvBack();
+  return "handled";
+}
+document.addEventListener("keydown", function(e){
+  var c=e.keyCode||e.which;
+  if(c===13) return; /* OK/select comes from the native bridge (dispatchKeyEvent) */
+  if(c===37||c===38||c===39||c===40){ e.preventDefault(); }
+  if(onKeyDown(c, !!e.repeat)) e.preventDefault();
+});
+document.addEventListener("keyup", function(e){
+  var c=e.keyCode||e.which;
+  if(onKeyUp(c)) e.preventDefault();
+});
+</script>
+<script>
+"use strict";
+/* ================= rendering ================= */
+var cv=$("game"), cx2d=cv.getContext("2d");
+var VW=0, VH=0, DPR=1;
+var GOLD="#f5c518", DARK="#0a0a0a";
+function resize(){
+  DPR=Math.min(2, window.devicePixelRatio||1);
+  VW=window.innerWidth; VH=window.innerHeight;
+  cv.width=VW*DPR; cv.height=VH*DPR;
+  cx2d.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener("resize", resize); resize();
+
+var SY_FOUL=0.94, SY_PIN=0.28;
+function project(x,z){
+  var t=clamp(z/68,0,1.05);
+  var sy=VH*lerp(SY_FOUL,SY_PIN,t);
+  var scale=1/(1+t*7);
+  var sx=VW/2 + x*scale*(VW*0.30);
+  return {x:sx, y:sy, s:scale};
+}
+function drawLane(){
+  cx2d.fillStyle=DARK; cx2d.fillRect(0,0,VW,VH);
+  /* gutters */
+  var g1=project(-2.35,0), g2=project(-2.35,68), g3=project(-1.78,68), g4=project(-1.78,0);
+  var h1=project(2.35,0), h2=project(2.35,68), h3=project(1.78,68), h4=project(1.78,0);
+  cx2d.fillStyle="#1a1a1a";
+  cx2d.beginPath(); cx2d.moveTo(g1.x,g1.y); cx2d.lineTo(g2.x,g2.y); cx2d.lineTo(g3.x,g3.y); cx2d.lineTo(g4.x,g4.y); cx2d.closePath(); cx2d.fill();
+  cx2d.beginPath(); cx2d.moveTo(h1.x,h1.y); cx2d.lineTo(h2.x,h2.y); cx2d.lineTo(h3.x,h3.y); cx2d.lineTo(h4.x,h4.y); cx2d.closePath(); cx2d.fill();
+  /* lane wood */
+  var l1=project(-LANE_HALF,0), l2=project(-LANE_HALF,68), l3=project(LANE_HALF,68), l4=project(LANE_HALF,0);
+  var grd=cx2d.createLinearGradient(0,l4.y,0,l2.y);
+  grd.addColorStop(0,"#5a3a1a"); grd.addColorStop(1,"#3a2410");
+  cx2d.fillStyle=grd;
+  cx2d.beginPath(); cx2d.moveTo(l1.x,l1.y); cx2d.lineTo(l2.x,l2.y); cx2d.lineTo(l3.x,l3.y); cx2d.lineTo(l4.x,l4.y); cx2d.closePath(); cx2d.fill();
+  /* boards */
+  cx2d.strokeStyle="rgba(0,0,0,0.35)"; cx2d.lineWidth=1;
+  for(var b=-3;b<=3;b++){
+    var a=project(b*0.5,0), c=project(b*0.5,68);
+    cx2d.beginPath(); cx2d.moveTo(a.x,a.y); cx2d.lineTo(c.x,c.y); cx2d.stroke();
+  }
+  /* arrows */
+  cx2d.fillStyle=GOLD;
+  var ax=[-1,-0.5,0,0.5,1];
+  for(var i=0;i<ax.length;i++){
+    var p=project(ax[i],14);
+    cx2d.beginPath();
+    cx2d.moveTo(p.x,p.y-7*p.s); cx2d.lineTo(p.x-4*p.s,p.y+4*p.s); cx2d.lineTo(p.x+4*p.s,p.y+4*p.s);
+    cx2d.closePath(); cx2d.fill();
+  }
+  /* foul line */
+  var f1=project(-LANE_HALF,0), f2=project(LANE_HALF,0);
+  cx2d.strokeStyle=GOLD; cx2d.lineWidth=3;
+  cx2d.beginPath(); cx2d.moveTo(f1.x,f1.y); cx2d.lineTo(f2.x,f2.y); cx2d.stroke();
+}
+function drawPins(){
+  var order=G.pins.slice().sort(function(a,b){return b.z-a.z;});
+  for(var i=0;i<order.length;i++){
+    var p=order[i]; if(p.down && p.flyT>=1.4) continue;
+    var pr=project(p.x,p.z);
+    var hop=(p.down?Math.sin(Math.min(1,p.flyT/1.4)*Math.PI)*30*p.s:0);
+    var r=Math.max(2, PIN_R*pr.s*VW*0.30);
+    var y=pr.y-hop-r;
+    cx2d.fillStyle="rgba(0,0,0,0.4)";
+    cx2d.beginPath(); cx2d.ellipse(pr.x,pr.y,r*0.9,r*0.35,0,0,Math.PI*2); cx2d.fill();
+    cx2d.fillStyle=p.down?"#cccccc":"#ffffff";
+    cx2d.beginPath(); cx2d.arc(pr.x,y,r,0,Math.PI*2); cx2d.fill();
+    cx2d.strokeStyle="#c00"; cx2d.lineWidth=Math.max(1,r*0.18);
+    cx2d.beginPath(); cx2d.arc(pr.x,y,r*0.55,Math.PI*1.15,Math.PI*1.85); cx2d.stroke();
+    cx2d.fillStyle="rgba(255,255,255,0.85)";
+    cx2d.beginPath(); cx2d.arc(pr.x-r*0.3,y-r*0.3,r*0.25,0,Math.PI*2); cx2d.fill();
+  }
+}
+function drawBall(){
+  var b=G.ballObj;
+  var bx, bz, br, label=null;
+  if(b){ bx=b.x; bz=b.z; }
+  else { bx=POSITIONS[G.posIdx]; bz=2.5; label="aim"; }
+  var pr=project(bx,bz);
+  var r=Math.max(3,BALL_R*pr.s*VW*0.30);
+  var grd=cx2d.createRadialGradient(pr.x-r*0.3,pr.y-r*0.3,r*0.1,pr.x,pr.y,r);
+  grd.addColorStop(0,"#3a3a6a"); grd.addColorStop(1,"#101024");
+  cx2d.fillStyle=grd;
+  cx2d.beginPath(); cx2d.arc(pr.x,pr.y,r,0,Math.PI*2); cx2d.fill();
+  cx2d.strokeStyle=GOLD; cx2d.lineWidth=2;
+  cx2d.beginPath(); cx2d.arc(pr.x,pr.y,r*0.55,0.6,2.4); cx2d.stroke();
+  if(label && (G.screen==="aim")){
+    /* position marker */
+    cx2d.fillStyle=GOLD; cx2d.font="bold 18px sans-serif"; cx2d.textAlign="center";
+    cx2d.fillText(POS_NAMES[G.posIdx], pr.x, pr.y+r+22);
+  }
+}
+function drawAimLine(){
+  if(G.screen!=="aim"&&G.screen!=="windup") return;
+  var ang=G.angleDeg*Math.PI/180;
+  var vz = G.screen==="windup" ? (26+G.power*22) : 38;
+  var x=POSITIONS[G.posIdx], z=0, vx=Math.sin(ang)*vz, spin=G.spin;
+  cx2d.fillStyle="rgba(245,197,24,0.85)";
+  for(var t=0;t<1.6;t+=0.05){
+    var dt=0.05;
+    if(z<55) vx+=spin*7.5*dt;
+    x+=vx*dt; z+=vz*dt;
+    if(Math.abs(x)>LANE_HALF&&z<64) break;
+    var pr=project(x,Math.min(z,66));
+    cx2d.beginPath(); cx2d.arc(pr.x,pr.y,Math.max(1.5,3*pr.s),0,Math.PI*2); cx2d.fill();
+  }
+}
+function drawPowerMeter(){
+  if(G.screen!=="windup") return;
+  var w=34, h=VH*0.5, x=VW-w-30, y=VH*0.22;
+  cx2d.fillStyle="rgba(0,0,0,0.6)";
+  cx2d.fillRect(x-6,y-30,w+12,h+60);
+  cx2d.fillStyle="#222"; cx2d.fillRect(x,y,w,h);
+  var ph=h*G.power;
+  var grd=cx2d.createLinearGradient(0,y+h,0,y);
+  grd.addColorStop(0,"#2a7a2a"); grd.addColorStop(0.7,"#f5c518"); grd.addColorStop(1,"#c00");
+  cx2d.fillStyle=grd; cx2d.fillRect(x,y+h-ph,w,ph);
+  cx2d.strokeStyle=GOLD; cx2d.lineWidth=2; cx2d.strokeRect(x,y,w,h);
+  cx2d.fillStyle=GOLD; cx2d.font="bold 20px sans-serif"; cx2d.textAlign="center";
+  cx2d.fillText("POWER", x+w/2, y-8);
+  if(Math.abs(G.spin)>0.1){
+    cx2d.fillText(G.spin>0?"HOOK →":"← HOOK", x+w/2, y+h+28);
+  }
+}
+function throwMark(v){
+  if(v===10) return "X";
+  if(v===0) return "–";
+  return String(v);
+}
+function drawScoreboard(){
+  var sc=computeScore(G.rolls);
+  var n=10, bw=Math.min(86,(VW-40)/n), bh=64, x0=(VW-bw*n)/2, y0=12;
+  cx2d.textAlign="center"; cx2d.textBaseline="middle";
+  for(var f=0;f<n;f++){
+    var x=x0+f*bw, fr=sc.frames[f];
+    var cur=(f===G.frame-1 && G.screen!=="gameover");
+    cx2d.fillStyle=cur?"rgba(245,197,24,0.25)":"rgba(0,0,0,0.55)";
+    cx2d.fillRect(x,y0,bw-3,bh);
+    cx2d.strokeStyle=GOLD; cx2d.lineWidth=cur?3:1;
+    cx2d.strokeRect(x,y0,bw-3,bh);
+    cx2d.fillStyle="#888"; cx2d.font="14px sans-serif";
+    cx2d.fillText(String(f+1), x+(bw-3)/2, y0+11);
+    cx2d.fillStyle=GOLD; cx2d.font="bold 17px sans-serif";
+    var marks="";
+    if(fr){
+      if(fr.strike) marks="X";
+      else if(fr.spare) marks=fr.throws.map(throwMark).join(" / ");
+      else marks=fr.throws.map(throwMark).join(" ");
+      if(f===9 && fr.throws.length) marks=fr.throws.map(throwMark).join(" ");
+    }
+    cx2d.fillText(marks, x+(bw-3)/2, y0+30);
+    cx2d.fillStyle="#fff"; cx2d.font="bold 15px sans-serif";
+    if(fr&&fr.score!==null&&fr.score!==undefined) cx2d.fillText(String(fr.score), x+(bw-3)/2, y0+50);
+  }
+  cx2d.textAlign="left"; cx2d.textBaseline="alphabetic";
+}
+function drawCenterText(lines, highlight){
+  cx2d.textAlign="center";
+  var y=VH*0.34;
+  for(var i=0;i<lines.length;i++){
+    var L=lines[i];
+    cx2d.font=L.big?"bold 64px sans-serif":(L.med?"bold 30px sans-serif":"24px sans-serif");
+    cx2d.fillStyle=L.gold===false?"#fff":GOLD;
+    if(L.big){ cx2d.shadowColor="#000"; cx2d.shadowBlur=12; }
+    cx2d.fillText(L.t, VW/2, y);
+    cx2d.shadowBlur=0;
+    y+=L.big?84:(L.med?48:38);
+  }
+  cx2d.textAlign="left";
+}
+function drawTitle(){
+  drawCenterText([
+    {t:"🎳", big:true},
+    {t:"LYNXOS BOWLING", big:true},
+    {t:"Wii-style bowling for Fire TV", med:true, gold:false},
+    {t:" ", },
+    {t:"Press OK to play", med:true},
+    {t:"Best score: "+G.high, gold:false},
+    {t:" ", },
+    {t:"Left/Right: aim   Up/Down: angle", gold:false},
+    {t:"Hold OK to throw, release to let go", gold:false},
+    {t:"Left/Right while holding: hook", gold:false}
+  ]);
+}
+function drawPause(){
+  cx2d.fillStyle="rgba(0,0,0,0.72)"; cx2d.fillRect(0,0,VW,VH);
+  var items=["Resume game","Restart game","Quit to title"];
+  var lines=[{t:"PAUSED", big:true}];
+  for(var i=0;i<items.length;i++)
+    lines.push({t:(i===G.pauseIdx?"▶ ":"  ")+items[i], med:true, gold:i===G.pauseIdx});
+  drawCenterText(lines);
+}
+function drawGameOver(){
+  var s=computeScore(G.rolls).total;
+  drawCenterText([
+    {t:"GAME OVER", big:true},
+    {t:"Final score: "+s, med:true, gold:false},
+    {t:G.newBest?"★ NEW BEST! ★":"Best: "+G.high, med:true},
+    {t:" ", },
+    {t:"OK: new game", gold:false},
+    {t:"Back: title screen", gold:false}
+  ]);
+}
+function render(){
+  drawLane();
+  drawAimLine();
+  drawPins();
+  drawBall();
+  drawPowerMeter();
+  drawScoreboard();
+  if(G.screen==="title") drawTitle();
+  else if(G.screen==="pause") drawPause();
+  else if(G.screen==="gameover") drawGameOver();
+}
+
+/* ================= main loop ================= */
+var lastT=0;
+function loop(t){
+  requestAnimationFrame(loop);
+  var dt=Math.min(0.05,(t-lastT)/1000||0.016); lastT=t;
+  if(G.screen==="windup") updateWindup(dt);
+  else if(G.screen==="throw") updateThrow(dt);
+  else if(G.screen==="sweep") updateSweep(dt);
+  render();
+}
+
+/* ================= init ================= */
+resetRack();
+G.screen="title";
+requestAnimationFrame(loop);
+setTimeout(function(){ say("Lynxos Bowling. Press OK to play."); }, 600);
+</script>
+</body>
+</html>
